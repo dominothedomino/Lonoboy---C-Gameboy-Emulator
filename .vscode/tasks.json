@@ -14,7 +14,8 @@
                 "-o",
                 "${fileDirname}\\${fileBasenameNoExtension}.exe",
                 "-LC:\\vcpkg\\installed\\x64-windows\\lib",
-                "-lSDL3"
+                "-lSDL3",
+                "-std=c++17"
             ],
             "options": {
                 "cwd": "${fileDirname}"

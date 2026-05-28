@@ -25,7 +25,6 @@ class gameboy{
     public:
         fullReg BC{}, DE{}, HL{}, AF{};
         uint8_t* ROM{};
-        uint8_t currentBank = 1;
         uint8_t VRAM[0x2000]{};
         uint8_t ExRAM[0x2000]{};
         uint8_t RAM[0x2000]{};
@@ -40,10 +39,28 @@ class gameboy{
         uint16_t sp{};
         uint16_t pc{};
         uint8_t opcode{};
-        uint8_t mbctype{};
+
 
         bool stopped = false;
         bool halted = false;
+
+        ///////////////////////For MBC Banks//////////////////////////////
+        bool ramEn = false;
+        uint8_t mbctype{};
+        uint16_t romBank = 1;
+        uint8_t ramBank = 0;
+
+        uint8_t mbc1RomRamMode = 0;
+        uint8_t mbc1UpperBits = 0;
+
+        uint8_t rtcReg = 0;
+        bool rtcMapping =  false;
+        uint8_t rtcRegs[5]{}; //S, M, H, DL, DH
+        uint8_t rtcLatched[5]{};
+        bool rtcLatchArmed = false;
+        uint64_t rtcPrev = 0;
+
+        void updateRTC();
 
         ///////////////////////For Input//////////////////////////////////
         //start unpressed

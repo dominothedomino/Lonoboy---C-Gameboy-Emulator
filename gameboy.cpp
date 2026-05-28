@@ -575,6 +575,47 @@ gameboy::gameboy(){
     IE = 0x00;
 }
 
+void gameboy::updateRTC(){
+    uint64_t currTime = time(nullptr);
+    if(rtcPrev == 0){
+        rtcPrev = currTime;
+        return;
+    }
+
+    //if halt flag, clocks are frozen
+    if(rtcRegs[4] & 0x40) return;
+
+    uint64_t elapsed = currTime - rtcPrev;
+    if(elapsed == 0) return;
+    rtcPrev = currTime;
+
+    rtcRegs[0] += elapsed;
+
+    if(rtcRegs[0] >= 60){
+        rtcRegs[1] += rtcRegs[0] / 60;
+        rtcRegs[0] %= 60;
+    }
+
+    if(rtcRegs[1] >= 60){
+        rtcRegs[2] += rtcRegs[1] / 60;
+        rtcRegs[1] %= 60;
+    }
+
+    if(rtcRegs[2] >= 24){
+        uint16_t days = ((rtcRegs[4] & 0x01) << 8) | rtcRegs[3];
+        days += rtcRegs[2] / 24;
+        rtcRegs[2] %= 24;
+
+        if(days > 511){
+            days &= 0x1FF;
+            rtcRegs[4] |= 0x80; //overflow flag
+        }
+
+        rtcRegs[3] = days & 0xFF;
+        rtcRegs[4] = (rtcRegs[4] & 0xFE) | ((days >> 8) & 0x01);
+    }
+}
+
 void gameboy::updateJoypad(uint8_t newAction, uint8_t newDir){
     uint8_t select = io[0x00] & 0x30;
     uint8_t newBut, oldBut;
@@ -600,8 +641,6 @@ void gameboy::updateJoypad(uint8_t newAction, uint8_t newDir){
     actionBut = newAction;
     dirBut = newDir;
 }
-
-
 
 void gameboy::updatePPU(uint16_t cycles){
     if(!(io[0x40] & 0x80)){
@@ -968,11 +1007,102 @@ gameboy::~gameboy(){
 }
 
 void gameboy::switchBank(uint16_t address, uint8_t value){
-    if(address >= 0x2000 && address <= 0x3FFF){
-        currentBank = value & 0x1F;
-        if(currentBank == 0){
-            currentBank = 1;
-        }
+    switch(mbctype){
+        //no MBC (ROM only)
+        case 0x00:
+            break;
+        
+        //MBC 1
+        case 0x01:
+        case 0x02:
+        case 0x03:
+            if(address <= 0x1FFF){
+                ramEn = (value & 0x0F) == 0x0A;
+            }
+            else if(address <= 0x3FFF){
+                //5 bit ROM bank
+                uint8_t bank = value & 0x1F;
+                romBank = (romBank & 0x60) | bank;
+                if(romBank == 0x00 || romBank == 0x20 || romBank == 0x40 || romBank == 0x60) romBank++; //cannot map to bank 0
+            }
+            else if(address <= 0x5FFF){
+                //2 bit secondary register
+                mbc1UpperBits = value & 0x03;
+                if(!mbc1RomRamMode) romBank = (romBank & 0x1F) | (mbc1UpperBits << 5);
+                else ramBank = mbc1UpperBits;
+
+            }
+            else{
+                mbc1RomRamMode = value & 0x1F;
+                if(!mbc1RomRamMode){
+                    //switch to rom bank mode
+                    ramBank = 0;
+                    romBank = (romBank & 0x1F) | (mbc1UpperBits << 5);
+                }
+                else{
+                    //ram bank mode
+                    romBank &= 0x1F;
+                }
+            }
+            break;
+        
+        //MBC3
+        case 0x0F: case 0x10: case 0x11: case 0x12: case 0x13:
+            if(address <= 0x1FFF){
+                ramEn = (value & 0x0F) == 0x0A;
+            }
+            else if(address <= 0x3FFF){
+                //7 bit ROM bank, bank 0 to 1
+                romBank = value & 0x7F;
+                if(romBank == 0) romBank = 1;
+            }
+            else if(address <= 0x5FFF){
+                //ram bank OR real time clock reg
+                if(value <= 0x03){
+                    ramBank = value;
+                    rtcMapping = false;
+                }
+                else if(value >= 0x08 && value <= 0x0F){
+                    rtcReg = value - 0x08;
+                    rtcMapping = true;
+                }
+            }
+            else{
+                if(value == 0x00){
+                    rtcLatchArmed = true;
+                }
+                else if(value == 0x01 && rtcLatchArmed){
+                    for(int i = 0; i < 5; i++){
+                        rtcLatched[i] = rtcRegs[i];
+                    }
+                    rtcLatchArmed = false;
+                }
+                else{
+                    rtcLatchArmed = false;
+                }
+            }
+            break;
+
+        //MBC5
+        case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x1E:
+            if(address <= 0x1FFF){
+                ramEn = (value & 0x0F) == 0x0A;
+            }
+            else if(address <= 0x2FFF){
+                //8 bit rom bank, allows bank 0
+                romBank = (romBank & 0x100) | value;
+            }
+            else if(address <= 0x3FFF){
+                romBank = (romBank & 0xFF) | ((value & 0x01) << 8);
+            }
+            else if(address <= 0x5FFF){
+                //4 bit ram bank
+                ramBank = value & 0x0F;
+            }
+            break;
+        
+        default:
+            break;
     }
 }
 
@@ -982,13 +1112,19 @@ uint8_t gameboy::read(uint16_t address){
         else return 0xFF;
     }
     else if(address <= 0x7FFF){
-        return ROM[(0x4000 * currentBank) + (address - 0x4000)];    //for additional memory banks
+        uint32_t offset = (static_cast<uint32_t>(romBank) * 0x4000) + (address - 0x4000);
+        if(offset < ROMsize) return ROM[offset];
+        else return 0xFF;
     }
     else if(address <= 0x9FFF){
         return VRAM[address - 0x8000];
     }
     else if(address <= 0xBFFF){
-        return ExRAM[address - 0xA000];
+        if(!ramEn) return 0xFF;
+        if(rtcMapping) return rtcLatched[rtcReg];
+
+        uint32_t offset = (static_cast<uint32_t>(ramBank) * 0x2000) + (address - 0xA000);
+        return ExRAM[offset % sizeof(ExRAM)];
     }
     else if(address <= 0xDFFF){
         return RAM[address - 0xC000];
@@ -1030,7 +1166,16 @@ void gameboy::write(uint16_t address, uint8_t data){
         VRAM[address - 0x8000] = data;
     }
     else if(address <= 0xBFFF){
-        ExRAM[address - 0xA000] = data;
+        //write to ex ram only if enabled
+        if(!ramEn) return;
+        
+        if(rtcMapping){
+            rtcRegs[rtcReg] = data;
+            return;
+        }
+
+        uint32_t offset = (static_cast<uint32_t>(ramBank) * 0x2000) + (address - 0xA000);
+        ExRAM[offset % sizeof(ExRAM)] = data;
     }
     else if(address <= 0xDFFF){
         RAM[address - 0xC000] = data;
