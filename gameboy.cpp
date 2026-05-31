@@ -4,6 +4,16 @@
 #include <fstream>
 #include <set>
 
+//4 duty cycle modes for apu
+static const uint8_t DUTY_TABLE[4][8] = {
+    {0, 0, 0, 0, 0, 0, 0, 1},
+    {1, 0, 0, 0, 0, 0, 0, 1}, 
+    {1, 0, 0, 0, 1, 1, 1, 1},
+    {0, 1, 1, 1, 1, 1, 1, 0},  
+};
+
+static const uint16_t NOISE_DIVISORS[8] = {8, 16, 32, 48, 64, 80, 96, 112};
+
 gameboy::gameboy(){
     //skip Boot ROM
     sp = 0xFFFE; //goes to ff80
@@ -575,6 +585,308 @@ gameboy::gameboy(){
     IE = 0x00;
 }
 
+void gameboy::updateAPU(uint16_t cycles){
+    if(!(io[0x26] & 0x80)) return; //master sound off
+
+    //update ch1 timers
+    ch1.freqTimer -= cycles;
+    while(ch1.freqTimer <= 0){
+        ch1.freqTimer += (2048 - ch1.frequency) * 4;
+        ch1.dutyPos = (ch1.dutyPos + 1) & 0x07;
+    }
+
+    //update ch2 timers
+    ch2.freqTimer -= cycles;
+    while(ch2.freqTimer <= 0){
+        ch2.freqTimer += (2048 - ch2.frequency) * 4;
+        ch2.dutyPos = (ch2.dutyPos + 1) & 0x07;
+    }
+
+    //update ch3 timers
+    ch3.freqTimer -= cycles;
+    if(ch3.freqTimer <= 0){
+        ch3.freqTimer = (2048 - ch3.frequency) * 2;
+        ch3.wavePos = (ch3.wavePos + 1) & 31;
+
+        //get sample from the wave table
+        uint8_t waveBits = io[0x30 + (ch3.wavePos / 2)];
+        if(ch3.wavePos & 0x01) ch3.samepleBuffer = waveBits & 0x0F;
+        else ch3.samepleBuffer = waveBits >> 4;
+    }
+
+    //update ch4 lfsr
+    ch4.freqTimer -= cycles;
+    while(ch4.freqTimer <= 0){
+        ch4.freqTimer += NOISE_DIVISORS[ch4.divisor] << ch4.clockShift;
+
+        //lfsr msb is loaded with xor of bits 1,0
+        uint8_t xorBit = (ch4.lfsr & 0x01) ^ ((ch4.lfsr >> 1) & 0x01);
+        ch4.lfsr = (ch4.lfsr >> 1) | (xorBit << 14);
+        if(ch4.shortMode) ch4.lfsr = (ch4.lfsr & ~0x40) | (xorBit << 6);
+    }
+
+    apuDivTimer += cycles;
+    //Frame sequencer steps every 8192 cycles as counted by Div Timer (512 Hz)
+    while(apuDivTimer >= 8192){
+        apuDivTimer -= 8192;
+        stepFrameSequencer();
+    }
+
+    apuSampleTimer += cycles;
+    //95.1 cycles per sample technically, but i chose to round down
+    while(apuSampleTimer >= 95){
+        apuSampleTimer -= 95;
+        pushSample();
+    }
+}
+
+void gameboy::stepFrameSequencer(){
+    apuDiv = (apuDiv + 1) & 7;
+
+    //if steps 0, 2, 4, or 6
+    if(!(apuDiv & 0x01)) clockLengthCounters();
+
+    if(apuDiv == 2 || apuDiv == 6) clockSweep();
+
+    if(apuDiv == 7) clockEnvelopes();
+}
+
+void gameboy::clockLengthCounters(){
+    //channel 1
+    if(ch1.lengthEn && (ch1.lengthCounter > 0)){
+        ch1.lengthCounter--;
+        if(!ch1.lengthCounter) ch1.En = false;
+    }
+
+    //channel 2
+    if(ch2.lengthEn && (ch2.lengthCounter > 0)){
+        ch2.lengthCounter--;
+        if(!ch2.lengthCounter) ch2.En = false;
+    }
+
+    //channel 3
+    if(ch3.lengthEn && (ch3.lengthCounter > 0)){
+        ch3.lengthCounter--;
+        if(!ch3.lengthCounter) ch3.En = false;
+    }
+
+    //channel 4
+    if(ch4.lengthEn && (ch4.lengthCounter > 0)){
+        ch4.lengthCounter--;
+        if(!ch4.lengthCounter) ch4.En = false;
+    }
+}
+
+void gameboy::clockSweep(){
+    //channel 1
+    if(ch1.sweepTimer > 0) ch1.sweepTimer--;
+
+    if(!ch1.sweepTimer){
+        if(ch1.sweepPace > 0) ch1.sweepTimer = ch1.sweepPace;
+        else ch1.sweepTimer = 8;
+
+        if(ch1.sweepEn && (ch1.sweepPace > 0)){
+            uint16_t newFreq = calculateSweep();
+
+            //freq is not overflow and step is nonzero
+            if((ch1.frequency <= 2047) && (ch1.sweepStep > 0)){
+                ch1.frequency = newFreq;
+                ch1.sweepFreq = newFreq;
+
+                //update freq regs
+                io[0x13] = ch1.frequency & 0xFF;
+                io[0x14] = (io[0x14] & 0xF8) | ((ch1.frequency >> 8) & 0x07);
+
+                //dummy var, only want to set overflow regs
+                uint16_t dummyFreq = calculateSweep();
+            }
+        }
+
+    }
+
+}
+
+void gameboy::clockEnvelopes(){
+    //channel 1
+    if(ch1.envPace != 0){
+        if(ch1.envTimer > 0) ch1.envTimer--;
+        if(!ch1.envTimer){
+            ch1.envTimer = ch1.envPace;
+            if(ch1.envUp && (ch1.volume < 15)) ch1.volume++;
+            else if(!ch1.envUp && (ch1.volume > 0)) ch1.volume--;
+        }
+    }
+
+    //channel 2
+    if(ch2.envPace != 0){
+        if(ch2.envTimer > 0) ch2.envTimer--;
+        if(!ch2.envTimer){
+            ch2.envTimer = ch2.envPace;
+            if(ch2.envUp && (ch2.volume < 15)) ch2.volume++;
+            else if(!ch2.envUp && (ch2.volume > 0)) ch2.volume--;
+        }
+    }
+
+    //channel 3 has no envelope
+
+    //channel 4
+    if(ch4.envPace != 0){
+        if(ch4.envTimer > 0) ch4.envTimer--;
+        if(!ch4.envTimer){
+            ch4.envTimer = ch4.envPace;
+            if(ch4.envUp && (ch4.volume < 15)) ch4.volume++;
+            else if(!ch4.envUp && (ch4.volume > 0)) ch4.volume--;
+        }
+    }
+}
+
+void gameboy::pushSample(){
+    if(!audioStream) return;
+
+    //prevent SDL from taking too many samples
+    //735 samples per frame, stereo sound (2 channels), want bytes, and want to keep at most 4 frames worth of samples
+    int queued = SDL_GetAudioStreamQueued(audioStream);
+    if(queued > (735 * 4 * sizeof(float) * 2)){
+        return;
+    }
+
+    //get ch1 output
+    float ch1Sample = 0.0;
+    if(ch1.En){
+        uint8_t dutyBit = DUTY_TABLE[ch1.duty][ch1.dutyPos];
+        if(dutyBit) ch1Sample = ch1.volume / 15.0f;
+        else ch1Sample = 0.0;
+    }
+
+    //ch2
+    float ch2Sample = 0.0;
+    if(ch2.En){
+        uint8_t dutyBit = DUTY_TABLE[ch2.duty][ch2.dutyPos];
+        if(dutyBit) ch2Sample = ch2.volume / 15.0f;
+        else ch2Sample = 0.0;
+    }
+
+    //ch3
+    float ch3Sample = 0.0;
+    if(ch3.En && ch3.dacEn){
+        float rawData = ch3.samepleBuffer / 15.0f;
+        //refer to .h for volume buffer settings
+        switch(ch3.volumeShift){
+            case 0:{
+                ch3Sample = 0.0;
+                break;
+            }
+            case 1:{
+                ch3Sample = rawData;
+                break;
+            }
+            case 2:{
+                ch3Sample = rawData / 2.0f;
+                break;
+            }
+            case 3:{
+                ch3Sample = rawData / 4.0f;
+                break;
+            }
+        }
+    }
+
+    //ch4
+    float ch4Sample = 0.0;
+    if(ch4.En){
+        //output negative logic with lfsr lsb
+        if(!(ch4.lfsr & 0x01)) ch4Sample = ch4.volume / 15.0f;
+    }
+
+    //master vol - NR50
+    float leftVol = ((io[0x24] >> 4) & 0x07) / 7.0f;
+    float rightVol= (io[0x24] & 0x07) / 7.0f;
+
+    //panning - NR51
+    float left, right;
+    left = right = 0.0;
+    if(io[0x25] & 0x10) left += ch1Sample * leftVol;
+    if(io[0x25] & 0x01) right += ch1Sample * rightVol;
+    if(io[0x25] & 0x20) left += ch2Sample * leftVol;
+    if(io[0x25] & 0x02) right += ch2Sample * rightVol;
+    if(io[0x25] & 0x40) left += ch3Sample * leftVol;
+    if(io[0x25] & 0x04) right += ch3Sample * rightVol;
+    if(io[0x25] & 0x80) left += ch4Sample * leftVol;
+    if(io[0x25] & 0x08) right += ch4Sample * rightVol;
+
+    //clamp to -1/1 to avoid clipping
+    if(left > 1.0) left = 1.0;
+    if(left < -1.0) left = -1.0;
+    if(right > 1.0) right = 1.0;
+    if(right < -1.0) right = -1.0;
+
+    //low pass filter to get rid of grainyness
+    float audioFilterL = 0.0;
+    float audioFilterR = 0.0;
+    const float coeff = 0.85;
+    audioFilterL = (audioFilterL * coeff) + (left * (1.0 - coeff));
+    audioFilterR = (audioFilterR * coeff) + (left * (1.0 - coeff));
+
+    float samples[2] = {audioFilterL, audioFilterR}; //L and R channels
+    SDL_PutAudioStreamData(audioStream, samples, sizeof(samples));
+}
+
+void gameboy::triggerChannel1(){
+    ch1.En = true;
+
+    if(!ch1.lengthCounter) ch1.lengthCounter = 64;
+    ch1.freqTimer = (2048 - ch1.frequency) * 4;
+    ch1.volume = ch1.initialVol;
+    ch1.envTimer = ch1.envPace;
+
+    //init sweep
+    ch1.sweepFreq = ch1.frequency;
+    if(ch1.sweepPace > 0) ch1.sweepTimer = ch1.sweepPace;
+    else ch1.sweepTimer = 8;
+    ch1.sweepEn = (ch1.sweepPace > 0) || (ch1.sweepStep > 0);
+
+    //if sweep step nonzero, caluclate overflow; use a dummy variable to do so, we just want to check overflow and set channels, not get new freq
+    if(ch1.sweepStep > 0){
+        uint16_t newFreq = calculateSweep();
+    } 
+}
+
+void gameboy::triggerChannel2(){
+    ch2.En = true;
+
+    if(!ch2.lengthCounter) ch2.lengthCounter = 64;
+    ch2.freqTimer = (2048 - ch2.frequency) * 4;
+    ch2.volume = ch2.initialVol;
+    ch2.envTimer = ch2.envPace;
+}
+
+void gameboy::triggerChannel3(){
+    ch3.En = ch3.dacEn;
+    if(!ch3.lengthCounter) ch3.lengthCounter = 256;
+    ch3.freqTimer = (2048 - ch3.freqTimer) * 2;
+    ch3.wavePos = 0;
+}
+
+void gameboy::triggerChannel4(){
+    ch4.En = true;
+    if(!ch4.lengthCounter) ch4.lengthCounter = 64;
+    ch4.volume = ch4.initialVol;
+    ch4.envTimer = ch4.envPace;
+    ch4.lfsr = 0x7FFF;
+    ch4.freqTimer = NOISE_DIVISORS[ch4.divisor] << ch4.clockShift;
+}
+
+uint16_t gameboy::calculateSweep(){
+    uint16_t newFreq = ch1.sweepFreq >> ch1.sweepStep;
+    if(ch1.sweepUp) newFreq = ch1.sweepFreq + newFreq;
+    else newFreq = ch1.sweepFreq - newFreq;
+
+    //overflow
+    if(newFreq > 2047) ch1.En = false;
+
+    return newFreq;
+}
+
 void gameboy::updateRTC(){
     uint64_t currTime = time(nullptr);
     if(rtcPrev == 0){
@@ -1004,6 +1316,7 @@ void gameboy::loadROM(const char* fileName){
 
 gameboy::~gameboy(){
     delete [] ROM;
+    if(audioStream) SDL_DestroyAudioStream(audioStream);
 }
 
 void gameboy::switchBank(uint16_t address, uint8_t value){
@@ -1189,6 +1502,129 @@ void gameboy::write(uint16_t address, uint8_t data){
     else if(address <= 0xFEFF){}
     else if(address <= 0xFF7F){
         io[address - 0xFF00] = data;
+
+        if(address == 0xFF10){
+            //NR10 - sweep
+            ch1.sweepPace = (data >> 4) & 0x07;
+            ch1.sweepUp = !((data  >> 3) & 0x01);
+            //ch1.sweepFreq = data & 0x03;
+        }
+
+        else if(address == 0xFF11){
+            //NR11 - length
+            ch1.duty = (data >> 6) & 0x03;
+            ch1.lengthLoad = data & 0x3F;
+            ch1.lengthCounter = 64 - ch1.lengthLoad;
+        }
+
+        else if(address == 0xFF12){
+            //NR12 - volume
+            ch1.initialVol = (data >> 4) & 0x0F;
+            ch1.envUp = (data >> 3) & 0x01;
+            ch1.envPace = data & 0x07;
+            if(!(data & 0xF8)) ch1.En = false;
+        }
+
+        else if(address == 0xFF13){
+            //NR13 - frequency low byte
+            ch1.frequency = (ch1.frequency & 0x700) | data;
+        }
+
+        else if(address == 0xFF14){
+            //NR14 - frequency upper bits, control
+            ch1.frequency = (ch1.frequency & 0x0FF) | ((data & 0x07) << 8);
+            ch1.lengthEn = (data >> 6) & 0x01;
+
+            //if bit 7, restart channel 1
+            if(data & 0x80) triggerChannel1();
+        }
+
+        else if(address == 0xFF16){
+            //NR21 - Length (skip sweep for channel 2)
+            ch2.duty = (data >> 6) & 0x03;
+            ch2.lengthLoad = data & 0x3F;
+            ch2.lengthCounter = 64 - ch2.lengthLoad;
+        }
+
+        else if(address == 0xFF17){
+            //NR22 - volume
+            ch2.initialVol = (data >> 4) & 0x0F;
+            ch2.envUp = (data >> 3) & 0x01;
+            ch2.envPace = data & 0x07;
+            if(!(data & 0xF8)) ch2.En = false;
+        }
+
+        else if(address == 0xFF18){
+            //NR23 - Freq low byte
+            ch2.frequency = (ch2.frequency & 0x700) | data;
+        }
+
+        else if(address == 0xFF19){
+            //NR24 - freq upper bits/control
+            ch2.frequency = (ch2.frequency & 0x0FF) | ((data & 0x07) << 8);
+            ch2.lengthEn = (data >> 6) & 0x01;
+
+            //if bit 7, restart channel 1
+            if(data & 0x80) triggerChannel2();
+        }
+
+        else if(address == 0xFF1A){
+            //NR30 - DAC en
+            ch3.dacEn = (data >> 7) & 0x01;
+            if(!ch3.dacEn) ch3.En = false;
+        }
+
+        else if(address == 0xFF1B){
+            //NR31 - length
+            ch3.lengthLoad = data;
+            ch3.lengthCounter = 256 - ch3.lengthLoad;
+        }
+
+        else if(address == 0xFF1C){
+            //NR32 - volume
+            ch3.volumeShift = (data >> 5) & 0x03;
+        }
+
+        else if(address == 0xFF1D){
+            //NR33 - freq low byte
+            ch3.frequency = (ch3.frequency & 0x700) | data;
+        }
+
+        else if(address == 0xFF1E){
+            //NR34 - high byte freq/control
+            ch3.frequency = (ch3.frequency & 0x0FF) | ((data & 0x07) << 8);
+            ch3.lengthEn = (data >> 6) & 0x01;
+            if(data & 0x80) triggerChannel3();
+        }
+
+        else if(address == 0xFF20){
+            //NR41 - length
+            ch4.lengthLoad = data & 0x3F;
+            ch4.lengthCounter = 64 - ch4.lengthLoad;
+        }
+
+        else if(address == 0xFF21){
+            //NR42 - volume
+            ch4.initialVol = (data >> 4) & 0x0F;
+            ch4.envUp = (data >> 3) & 0x01;
+            ch4.envPace = data & 0x07;
+            if(!(data & 0xF8)) ch4.En = false;
+        }
+
+        else if(address == 0xFF22){
+            //NR43 - clock shift, lfsr width, clock divide
+            ch4.clockShift = (data >> 4) & 0x0F;
+            ch4.shortMode = (data >> 3) & 0x01;
+            ch4.divisor = data & 0x07;
+        }
+
+        else if(address == 0xFF23){
+            //NR44 - control
+            ch4.lengthEn = (data >> 6) & 0x01;
+            if(data & 0x80) triggerChannel4();
+        }
+
+
 
         if(address == 0xFF44){
             io[0x44] = 0;

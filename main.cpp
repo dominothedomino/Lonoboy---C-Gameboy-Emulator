@@ -13,6 +13,7 @@ int main(int argc, char* argv[]){
 
     Platform platform("Gameboy", SCALE * VIDEOWIDTH, SCALE * VIDEOHEIGHT, VIDEOWIDTH, VIDEOHEIGHT);
     gameboy gb;
+    gb.audioStream = platform.getAudioStream();
     // gb.logFile.open("gameboy.log");
     gb.loadROM(argv[1]);
 
@@ -30,6 +31,7 @@ int main(int argc, char* argv[]){
             uint16_t cycles = gb.Cycle();
             gb.updateTimers(cycles);
             gb.updatePPU(cycles);
+            gb.updateAPU(cycles);
             gb.handleInterrupts();
         }
 

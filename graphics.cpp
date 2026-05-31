@@ -4,7 +4,7 @@
 class Platform{
     public:
         Platform(const char* title, int windowWidth, int windowHeight, int textureWidth, int textureHeight){
-            SDL_Init(SDL_INIT_VIDEO);
+            SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
             window = SDL_CreateWindow(title, windowWidth, windowHeight, 0);
             if(!window){
                 SDL_Log("Failed to create window: %s", SDL_GetError());
@@ -19,9 +19,20 @@ class Platform{
             if(!texture){
                 SDL_Log("Failed to create texture: %s", SDL_GetError());
             }
+
+            SDL_AudioSpec spec;
+            spec.freq = 44100;
+            spec.format = SDL_AUDIO_F32;
+            spec.channels = 2;
+            audioStream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+            if(!audioStream){
+                SDL_Log("Failed to create audio stream: %s", SDL_GetError());
+            }
+            SDL_ResumeAudioStreamDevice(audioStream);
         }
 
         ~Platform(){
+            SDL_DestroyAudioStream(audioStream);
             SDL_DestroyTexture(texture);
             SDL_DestroyRenderer(renderer);
             SDL_DestroyWindow(window);
@@ -72,10 +83,15 @@ class Platform{
             return quit;
         }
 
+        SDL_AudioStream* getAudioStream(){
+            return audioStream;
+        }
+
 
 
     private:
     SDL_Window* window{};
     SDL_Renderer* renderer{};
     SDL_Texture* texture{};
+    SDL_AudioStream* audioStream{};
 };

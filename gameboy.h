@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <fstream>
 #include <iomanip>
+#include <SDL3/SDL.h>
 #include "graphics.cpp"
 
 const unsigned int VIDEOWIDTH = 160;
@@ -20,6 +21,81 @@ struct Sprite{
     uint8_t tile;
     uint8_t flags;
 };
+
+//audio channel structs
+typedef struct{
+    uint8_t sweepPace = 0;
+    bool sweepUp = true;    //add or sub
+    uint8_t sweepStep = 0;
+    uint8_t duty = 2;       //4 modes   
+    uint8_t lengthLoad = 0;  //init value
+    uint8_t initialVol = 0; //init volume
+    bool envUp = false;
+    uint8_t envPace = 0;
+    uint16_t frequency = 0;
+    bool lengthEn = false;
+    bool En = false;
+
+    uint8_t dutyPos = 0;
+    uint8_t lengthCounter = 0;
+    uint8_t volume = 0;
+    uint8_t envTimer = 0;
+    int16_t freqTimer = 0; //down counter
+
+    uint16_t sweepFreq = 0;
+    uint8_t sweepTimer = 0;
+    bool sweepEn = false;
+}sweepCh;
+
+typedef struct{
+    uint8_t duty = 2;       //4 modes   
+    uint8_t lengthLoad = 0;  //init value
+    uint8_t initialVol = 0; //init volume
+    bool envUp = false;
+    uint8_t envPace = 0;
+    uint16_t frequency = 0;
+    bool lengthEn = false;
+    bool En = false;
+
+    uint8_t dutyPos = 0;
+    uint8_t lengthCounter = 0;
+    uint8_t volume = 0;
+    uint8_t envTimer = 0;
+    int16_t freqTimer = 0; //down counter
+}pulseCh;
+
+typedef struct{
+    bool dacEn = false;
+    uint8_t lengthLoad = 0;
+    uint8_t volumeShift = 0; //0 mute, 1 100%, 2 50%, 3 25%
+    uint16_t frequency = 0;
+    bool lengthEn = false;
+    bool En = false;
+
+    uint8_t lengthCounter = 0;
+    int32_t freqTimer = 0;
+    uint8_t wavePos = 0; //based on wave table 0-31
+    uint8_t samepleBuffer = 0;
+}waveCh;
+
+typedef struct{
+    uint8_t lengthLoad = 0;  //init value
+    uint8_t initialVol = 0; //init volume
+    bool envUp = false;
+    uint8_t envPace = 0;
+    bool lengthEn = false;
+    bool En = false;
+
+    uint8_t clockShift = 0; //how fast lfsr clocks
+    bool shortMode = false; //false = 15 bit lfsr, t = 7 bit
+    uint8_t divisor = 0; //divides clock
+
+    uint8_t lengthCounter = 0;
+    uint8_t volume = 0;
+    uint8_t envTimer = 0;
+    uint16_t lfsr = 0x7FFF; //init 15 bits to 1s
+    int32_t freqTimer = 0;
+}noiseCh;
 
 class gameboy{
     public:
@@ -43,6 +119,34 @@ class gameboy{
 
         bool stopped = false;
         bool halted = false;
+
+        ///////////////////////For APU/////////////////////////////////////
+        uint8_t apuDiv = 0;
+        uint32_t apuDivTimer = 0;       //cycles until next frame sequencer step
+        uint32_t apuSampleTimer = 0;    //cycles until next audio sample
+
+        SDL_AudioStream* audioStream{};
+
+        sweepCh ch1;
+        void triggerChannel1();
+        uint16_t calculateSweep();
+
+        pulseCh ch2;
+        void triggerChannel2();
+
+        waveCh ch3;
+        void triggerChannel3();
+
+        noiseCh ch4;
+        void triggerChannel4();
+
+        void updateAPU(uint16_t cycles);
+        void stepFrameSequencer();
+
+        void clockLengthCounters();
+        void clockSweep();
+        void clockEnvelopes();
+        void pushSample();
 
         ///////////////////////For MBC Banks//////////////////////////////
         bool ramEn = false;
@@ -81,6 +185,7 @@ class gameboy{
         void drawScanLine();
         void renderLine();
         void checkGraphicsInt();
+
 
 
         /////////////////////For CPU Setup////////////////////////////////
